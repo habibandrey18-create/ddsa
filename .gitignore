@@ -1,0 +1,42 @@
+# env & secrets
+.env
+cookies.json
+
+# virtual environments
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# databases
+*.db
+*.db-shm
+*.db-wal
+
+# logs
+*.log
+logs/
+
+# backups
+bot_backup_*.db
+
+# build & debug
+build/
+debug/
+storage_states/
+
+# temp downloads
+temp_downloads/
+
+# cursor
+.cursor/
+
+# tests output
+test_*.txt
+test_results.txt
+diagnostic_output.txt
+
+# OS / archives
+*.zip

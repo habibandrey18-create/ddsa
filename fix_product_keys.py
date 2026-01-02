@@ -1,0 +1,81 @@
+# fix_product_keys.py
+import sqlite3
+from datetime import datetime
+, make_product_key
+
+DB = "bot_database.db"  # путь к вашей БД
+
+def column_exists(cur, table, column):
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return column in cols
+
+def main():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # 1) добавить колонки product_key если нет
+    for table in ("queue", "history"):
+        if not column_exists(cur, table, "product_key"):
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN product_key TEXT")
+                print(f"Added product_key to {table}")
+            except Exception as e:
+                print(f"Could not add product_key to {table}: {e}")
+
+    # 2) временно удалить уникальный индекс для backfill
+    try:
+        cur.execute("DROP INDEX IF EXISTS idx_queue_product_key")
+        print("Dropped unique index for backfill")
+    except Exception as e:
+        print("Index drop error:", e)
+
+    conn.commit()
+
+    # 3) backfill: пересчитать product_key для существующих записей
+    # queue - таблица queue не имеет колонки title, только url
+    cur.execute("SELECT rowid, url FROM queue WHERE product_key IS NULL OR product_key = ''")
+    rows = cur.fetchall()
+    for r in rows:
+        url = r[1] or ""  # url is second column (index 1)
+        pk = db.make_product_key(url=url)  # только по URL
+        cur.execute("UPDATE queue SET product_key = ? WHERE rowid = ?", (pk, r[0]))  # rowid is first column (index 0)
+    print(f"Backfilled queue: {len(rows)} rows")
+
+    # posted_products - для существующих записей product_key уже должен быть заполнен при публикации
+    # но если есть старые записи без ключа, мы не можем восстановить его из доступных данных
+    cur.execute("SELECT COUNT(*) as count FROM posted_products WHERE product_key IS NULL OR product_key = ''")
+    empty_count = cur.fetchone()["count"]
+    if empty_count > 0:
+        print(f"Warning: {empty_count} posted_products records have empty product_key - these cannot be backfilled")
+        # можно либо удалить их, либо оставить как есть
+        # cur.execute("DELETE FROM posted_products WHERE product_key IS NULL OR product_key = ''")
+        # print(f"Deleted {conn.total_changes} invalid posted_products records")
+
+    conn.commit()
+
+    # 4) очистка дублей в queue: оставим только самую раннюю запись для каждого product_key
+    cur.execute("""
+      DELETE FROM queue
+      WHERE rowid NOT IN (
+        SELECT MIN(rowid) FROM queue GROUP BY product_key HAVING product_key IS NOT NULL AND product_key != ''
+      )
+    """)
+    deleted = conn.total_changes
+    conn.commit()
+    print("Deduped queue (deleted rows):", deleted)
+
+    # 5) создать уникальный индекс после очистки дублей
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_product_key ON queue(product_key)")
+        print("Created unique index on queue.product_key")
+    except Exception as e:
+        print("Final index create error:", e)
+
+    conn.commit()
+    conn.close()
+    print("Migration/backfill finished.")
+
+if __name__ == "__main__":
+    main()

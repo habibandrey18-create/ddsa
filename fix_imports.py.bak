@@ -1,0 +1,43 @@
+# fix_imports.py — делайте backup перед запуском!
+import os
+from pathlib import Path
+
+ROOT = Path(".")
+PYFILES = [p for p in ROOT.rglob("*.py") if "venv" not in str(p) and "site-packages" not in str(p)]
+REPL_IMPORT = "from database import make_product_key"
+REPL_IMPORT2 = "from database import normalize_url"
+
+for p in PYFILES:
+    text = p.read_text(encoding="utf-8")
+    new = text
+    changed = False
+
+    if REPL_IMPORT in new:
+        new = new.replace(REPL_IMPORT, "")
+        changed = True
+    if REPL_IMPORT2 in new:
+        new = new.replace(REPL_IMPORT2, "")
+        changed = True
+
+    # осторожно: заменить вызовы make_product_key( -> db.make_product_key(
+    if "make_product_key(" in new:
+        new = new.replace("make_product_key(", "db.make_product_key(")
+        changed = True
+
+    if "normalize_url(" in new:
+        new = new.replace("normalize_url(", "db.normalize_url(")
+        changed = True
+
+    if changed:
+        bak = p.with_suffix(p.suffix + ".bak")
+        if not bak.exists():
+            p.rename(bak)
+            bak.write_text(text, encoding="utf-8")
+            p.write_text(new, encoding="utf-8")
+            print(f"Patched {p} (backup -> {bak})")
+        else:
+            # если .bak уже есть — просто перезаписываем оригинал
+            p.write_text(new, encoding="utf-8")
+            print(f"Patched {p} (backup existed)")
+
+print("Готово — проверь изменения вручную.")

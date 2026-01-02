@@ -1,0 +1,735 @@
+# services/auto_search_service.py
+"""Сервис для автоматического поиска товаров на Яндекс.Маркете"""
+import asyncio
+import logging
+import re
+import os
+import json
+import random
+from typing import List, Dict, Optional
+from urllib.parse import urlparse, urlencode, quote
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+# Импортируем централизованный HTTP клиент
+from services.http_client import HTTPClient
+from services.metrics import Metrics, Timer
+from services.filter_service import should_filter_product
+
+from datetime import datetime
+
+# ENHANCEMENT: Real User-Agent rotation to avoid detection
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
+# ENHANCEMENT: Expanded category keywords for deeper search
+SEARCH_KEYWORDS = [
+    # Electronics
+    "наушники",
+    "смартфон",
+    "планшет",
+    "ноутбук",
+    "телефон",
+    "часы",
+    "фитнес-браслет",
+    # Home & Garden
+    "посуда",
+    "текстиль",
+    "инструменты",
+    "светильник",
+    "мебель",
+    # Beauty & Health
+    "косметика",
+    "парфюм",
+    "шампунь",
+    "крем",
+    "маска",
+    # Kids
+    "игрушки",
+    "конструктор",
+    "пазлы",
+    "книга детская",
+    # Fashion
+    "одежда",
+    "обувь",
+    "аксессуары",
+    "рюкзак",
+    "сумка",
+    # Food
+    "кофе",
+    "чай",
+    "шоколад",
+    "конфеты",
+    "снеки",
+    # Sports
+    "спорт",
+    "тренажер",
+    "гантели",
+    "коврик",
+]
+
+
+def validate_yandex_market_url(url: str) -> bool:
+    """Валидирует URL Яндекс.Маркета"""
+    try:
+        parsed = urlparse(url)
+        return (
+            parsed.scheme in ("http", "https")
+            and "market.yandex.ru" in parsed.netloc
+            and (
+                "/card/" in parsed.path
+                or "/product/" in parsed.path
+                or "/cc/" in parsed.path
+            )
+        )
+    except Exception:
+        return False
+
+
+# Функция fetch_with_retry удалена - теперь используется HTTPClient
+
+
+class AutoSearchService:
+    def __init__(self, db, bot=None):
+        self.db = db
+        self.bot = bot
+        self.http_client = HTTPClient()
+        self.metrics = Metrics()
+
+    async def search_products(
+        self, query: str, max_results: int = 20, page: int = 1
+    ) -> List[Dict]:
+        """
+        Ищет товары по запросу на Яндекс.Маркете с улучшенной логикой парсинга.
+
+        ENHANCEMENTS:
+        - User-Agent rotation
+        - Pagination support (&page=N)
+        - JSON fallback parsing if HTML fails
+        """
+        with Timer("search_products", self.metrics):
+            try:
+                self.metrics.increment("search_products.attempts")
+
+                # ENHANCEMENT: Add pagination for deeper results
+                search_url = f"https://market.yandex.ru/search?text={quote(query)}"
+                if page > 1:
+                    search_url += f"&page={page}"
+
+                # ENHANCEMENT: Random User-Agent rotation
+                headers = {
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                }
+
+                html = await self.http_client.fetch_text(search_url, headers=headers)
+                if not html:
+                    self.metrics.record_error("search_products")
+                    return []
+
+                # Используем более быстрый парсер если доступен
+                try:
+                    from lxml import html as lxml_html
+
+                    soup = BeautifulSoup(html, "lxml")
+                except ImportError:
+                    soup = BeautifulSoup(html, "html.parser")
+
+                products = []
+
+                # Ищем ссылки на товары
+                product_links = soup.find_all("a", href=re.compile(r"/product/"))
+
+                for link in product_links[:max_results]:
+                    href = link.get("href", "")
+                    if href.startswith("/"):
+                        href = f"https://market.yandex.ru{href}"
+
+                    # Проверяем, что это действительно ссылка на товар
+                    if "/product/" in href and href not in [
+                        p.get("url") for p in products
+                    ]:
+                        products.append(
+                            {
+                                "url": href,
+                                "title": link.get_text(strip=True)[:100] or "Товар",
+                            }
+                        )
+
+                # ENHANCEMENT: JSON Fallback - parse <script> tags if HTML parsing found nothing
+                if not products:
+                    logger.info(
+                        "HTML parsing found no products, trying JSON fallback..."
+                    )
+                    try:
+                        # Find JSON data in <script> tags (common for SPAs)
+                        script_tags = soup.find_all(
+                            "script", type="application/ld+json"
+                        )
+                        for script in script_tags:
+                            try:
+                                data = json.loads(script.string)
+                                # Look for product URLs in JSON
+                                if isinstance(data, dict) and "url" in data:
+                                    url = data.get("url", "")
+                                    if "/product/" in url or "/card/" in url:
+                                        products.append(
+                                            {
+                                                "url": (
+                                                    f"https://market.yandex.ru{url}"
+                                                    if url.startswith("/")
+                                                    else url
+                                                ),
+                                                "title": data.get("name", "Товар")[
+                                                    :100
+                                                ],
+                                            }
+                                        )
+                            except json.JSONDecodeError:
+                                continue
+                    except Exception as e:
+                        logger.debug(f"JSON fallback failed: {e}")
+
+                logger.info(
+                    f"Найдено товаров: {len(products)} (query='{query}', page={page})"
+                )
+                return products
+
+            except Exception as e:
+                logger.exception(f"Ошибка поиска товаров: {e}")
+                return []
+
+    async def search_by_category(
+        self, category: str, max_results: int = 20
+    ) -> List[Dict]:
+        """Ищет товары по категории"""
+        category_queries = {
+            "еда": ["шоколад", "конфеты", "снеки", "кофе", "чай"],
+            "техника": ["наушники", "смартфон", "телефон", "ноутбук"],
+            "одежда": ["одежда", "рубашка", "куртка", "обувь"],
+            "игрушки": ["игрушки", "lego", "конструктор"],
+            "книги": ["книги", "учебник"],
+            "косметика": ["косметика", "крем", "шампунь"],
+        }
+
+        queries = category_queries.get(category.lower(), [category])
+        all_products = []
+
+        for query in queries[:2]:  # Берем первые 2 запроса
+            products = await self.search_products(query, max_results // len(queries))
+            all_products.extend(products)
+            await asyncio.sleep(2)  # Задержка между запросами
+
+        return all_products[:max_results]
+
+    async def get_products_from_main_page(self, max_results: int = 50) -> List[Dict]:
+        """Получает товары с главной страницы Яндекс.Маркета https://market.yandex.ru/"""
+        try:
+            # Только главная страница Яндекс.Маркета
+            main_page_url = "https://market.yandex.ru/"
+
+            # Загружаем cookies если есть
+            cookies_file = os.path.join(os.path.dirname(__file__), "..", "cookies.json")
+            cookies_header = ""
+            if os.path.exists(cookies_file):
+                try:
+                    import json
+
+                    with open(cookies_file, "r", encoding="utf-8") as f:
+                        cookies_data = json.load(f)
+                        if isinstance(cookies_data, list):
+                            # Формируем строку cookies для заголовка
+                            cookies_parts = []
+                            for cookie in cookies_data:
+                                if (
+                                    isinstance(cookie, dict)
+                                    and "name" in cookie
+                                    and "value" in cookie
+                                ):
+                                    cookies_parts.append(
+                                        f"{cookie['name']}={cookie['value']}"
+                                    )
+                            cookies_header = "; ".join(cookies_parts)
+                except Exception as e:
+                    logger.debug(f"Failed to load cookies: {e}")
+
+            headers = {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            }
+            if cookies_header:
+                headers["Cookie"] = cookies_header
+
+            products = []
+            seen_urls = set()
+
+            # Парсим товары с главной страницы
+            page_url = main_page_url
+            try:
+                with Timer("get_products_from_main_page.fetch", self.metrics):
+                    # Используем fetch_text для автоматического чтения и закрытия соединения
+                    html = await self.http_client.fetch_text(page_url, headers=headers)
+                    if not html:
+                        self.metrics.record_error("get_products_from_main_page")
+                        logger.error(
+                            f"Failed to fetch main page after retries: {page_url[:100]}"
+                        )
+                        return []
+
+                    # Используем более быстрый парсер если доступен
+                    try:
+                        from lxml import html as lxml_html
+
+                        soup = BeautifulSoup(html, "lxml")
+                    except ImportError:
+                        soup = BeautifulSoup(html, "html.parser")
+
+                    category_products_count = 0
+
+                    # УПРОЩЕННАЯ ЛОГИКА: Просто ищем обычные ссылки /card/ и /product/
+
+                    # Сначала ищем в тексте страницы (для динамического контента)
+                    page_text = html
+                    # Ищем ссылки /card/ и /product/ в тексте страницы
+                    card_matches = re.findall(
+                        r'https?://market\.yandex\.ru/card/[^\s"\'<>\)]+', page_text
+                    )
+                    product_matches = re.findall(
+                        r'https?://market\.yandex\.ru/product/[^\s"\'<>\)]+', page_text
+                    )
+
+                    # Обрабатываем найденные ссылки из текста
+                    for match_url in card_matches + product_matches:
+                        if len(products) >= max_results:
+                            break
+
+                        # Очищаем URL от лишних символов
+                        match_url = (
+                            match_url.split('"')[0]
+                            .split("'")[0]
+                            .split(">")[0]
+                            .split("<")[0]
+                            .split(")")[0]
+                        )
+                        match_url = match_url.split("#")[0]  # Убираем якоря
+
+                        # Валидируем URL
+                        if not validate_yandex_market_url(match_url):
+                            continue
+
+                        # Проверяем уникальность
+                        url_base = match_url.split("?")[0]
+                        if url_base in seen_urls:
+                            continue
+                        seen_urls.add(url_base)
+
+                        products.append(
+                            {"url": match_url, "title": "Товар с Яндекс.Маркета"}
+                        )
+                        category_products_count += 1
+
+                    # Также ищем в HTML тегах <a>
+                    all_links = soup.find_all("a", href=True)
+
+                    for link in all_links:
+                        if len(products) >= max_results:
+                            break
+
+                        href = link.get("href", "")
+
+                        # Пропускаем не товарные ссылки
+                        if not href or (
+                            "/card/" not in href and "/product/" not in href
+                        ):
+                            continue
+
+                        # Преобразуем относительные ссылки в абсолютные
+                        if href.startswith("/"):
+                            href = f"https://market.yandex.ru{href}"
+
+                        # Убираем якоря и фрагменты, но оставляем параметры (они могут быть важны)
+                        href_clean = href.split("#")[0]
+
+                        # Валидируем URL
+                        if not validate_yandex_market_url(href_clean):
+                            continue
+
+                        # Проверяем, что это уникальная ссылка (по базовому URL без параметров)
+                        url_base = href_clean.split("?")[0]
+                        if url_base in seen_urls:
+                            continue
+                        seen_urls.add(url_base)
+
+                        # Извлекаем название товара
+                        title = link.get_text(strip=True)[:100] or "Товар"
+
+                        # Если название пустое, пробуем найти в родительском элементе
+                        if not title or title == "Товар" or len(title) < 3:
+                            parent = link.find_parent(
+                                ["div", "article", "section", "li"]
+                            )
+                            if parent:
+                                # Ищем заголовки
+                                for tag in ["h1", "h2", "h3", "h4", "span", "div"]:
+                                    title_elem = parent.find(
+                                        tag,
+                                        class_=re.compile(
+                                            r"title|name|product|card", re.I
+                                        ),
+                                    )
+                                    if title_elem:
+                                        title = title_elem.get_text(strip=True)[:100]
+                                        if title and len(title) > 3:
+                                            break
+
+                                # Если не нашли, берем весь текст родителя
+                                if not title or title == "Товар":
+                                    parent_text = parent.get_text(strip=True)[:100]
+                                    if parent_text and len(parent_text) > 3:
+                                        title = parent_text
+
+                        # Если все еще нет названия, используем часть URL
+                        if not title or title == "Товар":
+                            url_parts = href_clean.split("/")
+                            for part in reversed(url_parts):
+                                if part and part not in [
+                                    "card",
+                                    "product",
+                                    "market.yandex.ru",
+                                ]:
+                                    title = part.replace("-", " ").title()[:100]
+                                    break
+
+                        products.append(
+                            {
+                                "url": href_clean,  # Используем ссылку с параметрами
+                                "title": title or "Товар",
+                            }
+                        )
+                        category_products_count += 1
+
+                    if category_products_count == 0:
+                        logger.warning(
+                            f"⚠️ Товары не найдены на главной странице. HTML длина: {len(html)}. Возможно, страница использует динамический контент."
+                        )
+
+                    logger.info(f"Найдено товаров с главной страницы: {len(products)}")
+                    return products
+
+            except Exception as e:
+                logger.exception(f"Error parsing main page: {e}")
+                return []
+
+        except Exception as e:
+            logger.exception(f"Ошибка получения товаров с главной страницы: {e}")
+            return []
+
+    async def auto_add_products_from_main_page(self, max_add: int = 20):
+        """
+        SMART SCRAPING STRATEGY (Problem #7 + Enhancements):
+
+        1. Try main page first
+        2. If < 2 new products found → IMMEDIATELY switch to keyword search
+        3. Use random keywords + pagination for deeper results
+        4. Uses fast O(1) duplicate checks via SQL index
+        """
+        try:
+            added = 0
+            skipped = 0
+
+            # STEP 1: Try main page with expanded fetch
+            logger.info("Step 1: Trying main page...")
+            products = await self.get_products_from_main_page(max_add * 10)
+
+            # Продолжаем искать, пока не найдем нужное количество новых товаров
+            # Process products from main page with fast O(1) duplicate checks
+            for product in products:
+                if added >= max_add:
+                    break
+                url = product["url"]
+
+                # Blacklist filter check
+                should_filter, filter_reason = should_filter_product(
+                    product, reason_prefix=""
+                )
+                if should_filter:
+                    skipped += 1
+                    continue
+
+                # Fast O(1) duplicate checks using SQL index
+                if self.db.exists_url(url, check_normalized=True):
+                    skipped += 1
+                    continue
+
+                # Extract product data for key generation
+                title = product.get('title', '')
+                vendor = product.get('vendor', '')
+                offerid = product.get('offerid')
+
+                product_key = db.make_product_key(title=title, vendor=vendor, offerid=offerid, url=url)
+
+                # проверяем: уже в очереди или недавно опубликован
+                if self.db.queue_contains_product_key(product_key):
+                    logger.info("Skip queue insert — already in queue (key=%s) url=%s", product_key, url)
+                    skipped += 1
+                    continue
+                else:
+                    if self.db.has_recent_post(product_key, days=7):
+                        logger.info("Skip queue insert — similar post in last 7 days (key=%s) url=%s", product_key, url)
+                        skipped += 1
+                        continue
+                    else:
+                        # безопасно вставляем; уникальный индекс предотвратит гонки
+                        self.db.add_queue_item_with_key(url=url, title=title, product_key=product_key)
+                        added += 1
+                        logger.info("Auto-search: added product to queue (key=%s) url=%s", product_key, url)
+
+            logger.info(f"Step 1 result: added={added}, skipped={skipped}")
+
+            # STEP 2: SMART FALLBACK - If < 2 new products → switch to keyword search
+            if added < 2:
+                logger.info(
+                    f"Step 2: Only {added} new products from main page. Switching to KEYWORD SEARCH..."
+                )
+
+                # Shuffle keywords for randomness
+                keywords = random.sample(SEARCH_KEYWORDS, min(10, len(SEARCH_KEYWORDS)))
+
+                for keyword in keywords:
+                    if added >= max_add:
+                        break
+
+                    # ENHANCEMENT: Random pagination for deeper results (page 1 or 2)
+                    page = random.randint(1, 2)
+                    logger.info(f"Searching: '{keyword}' (page={page})")
+
+                    try:
+                        search_products = await self.search_products(
+                            keyword, max_results=max_add * 3, page=page
+                        )
+                    except Exception as e:
+                        logger.error(f"Search error for '{keyword}': {e}")
+                        continue
+
+                    # Process search results
+                    for sp in search_products:
+                        if added >= max_add:
+                            break
+
+                        url = sp["url"]
+
+                        # Blacklist filter check
+                        should_filter, filter_reason = should_filter_product(
+                            sp, reason_prefix=""
+                        )
+                        if should_filter:
+                            skipped += 1
+                            continue
+
+                        # Fast O(1) checks
+                        if self.db.exists_url(url, check_normalized=True):
+                            skipped += 1
+                            continue
+
+                        # Extract product data for key generation
+                        title = product.get('title', '')
+                        vendor = product.get('vendor', '')
+                        offerid = product.get('offerid')
+
+                        product_key = db.make_product_key(title=title, vendor=vendor, offerid=offerid, url=url)
+
+                        # проверяем: уже в очереди или недавно опубликован
+                        if self.db.queue_contains_product_key(product_key):
+                            logger.info("Skip queue insert — already in queue (key=%s) url=%s", product_key, url)
+                            skipped += 1
+                            continue
+                        else:
+                            if self.db.has_recent_post(product_key, days=7):
+                                logger.info("Skip queue insert — similar post in last 7 days (key=%s) url=%s", product_key, url)
+                                skipped += 1
+                                continue
+                            else:
+                                # безопасно вставляем; уникальный индекс предотвратит гонки
+                                self.db.add_queue_item_with_key(url=url, title=title, product_key=product_key)
+                                added += 1
+                                logger.info("Auto-search: added product to queue (key=%s) url=%s", product_key, url)
+                        logger.info(f"✅ Keyword '{keyword}': added {url[:100]}...")
+
+                    await asyncio.sleep(0.5)  # Small delay between keyword searches
+
+            logger.info(f"FINAL: added={added}, skipped={skipped}")
+            return added
+
+        except Exception as e:
+            logger.exception(f"Ошибка автодобавления товаров: {e}")
+            return 0
+
+    async def auto_add_products(
+        self, query: str = None, category: str = None, max_add: int = 10
+    ):
+        """Автоматически ищет и добавляет товары в очередь"""
+        try:
+            if category:
+                products = await self.search_by_category(category, max_add * 2)
+            elif query:
+                products = await self.search_products(query, max_add * 2)
+            else:
+                logger.warning("Не указан запрос или категория")
+                return 0
+
+            added = 0
+            skipped = 0
+
+            for product in products:
+                url = product["url"]
+
+                # Blacklist filter check
+                should_filter, filter_reason = should_filter_product(
+                    product, reason_prefix=""
+                )
+                if should_filter:
+                    skipped += 1
+                    continue
+
+                # Extract product data for key generation
+                title = product.get('title', '')
+                vendor = product.get('vendor', '')
+                offerid = product.get('offerid')
+
+                product_key = db.make_product_key(title=title, vendor=vendor, offerid=offerid, url=url)
+
+                # проверяем: уже в очереди или недавно опубликован
+                if self.db.queue_contains_product_key(product_key):
+                    logger.info("Skip queue insert — already in queue (key=%s) url=%s", product_key, url)
+                    skipped += 1
+                    continue
+                else:
+                    if self.db.has_recent_post(product_key, days=7):
+                        logger.info("Skip queue insert — similar post in last 7 days (key=%s) url=%s", product_key, url)
+                        skipped += 1
+                        continue
+                    else:
+                        # безопасно вставляем; уникальный индекс предотвратит гонки
+                        self.db.add_queue_item_with_key(url=url, title=title, product_key=product_key)
+                        added += 1
+                        logger.info("Auto-search: added product to queue (key=%s) url=%s", product_key, url)
+
+                if added >= max_add:
+                    break
+
+            logger.info(f"Автодобавление: добавлено {added}, пропущено {skipped}")
+            return added
+
+        except Exception as e:
+            logger.exception(f"Ошибка автодобавления: {e}")
+            return 0
+
+    async def run_search_and_queue(self, global_settings, bot=None):
+        """
+        Run auto search and queue products according to settings.
+        This method replaces the auto_search_worker function and is designed to be called by APScheduler.
+
+        Args:
+            global_settings: Global settings object with configuration
+            bot: Bot instance for notifications (optional)
+        """
+        try:
+            # Get settings from Pydantic config
+            from config import settings
+
+            AUTO_SEARCH_ENABLED = settings.AUTO_SEARCH_ENABLED
+            AUTO_MAIN_PAGE_ENABLED = settings.AUTO_MAIN_PAGE_ENABLED
+            # Use default threshold since it's not in Pydantic config
+            AUTO_SEARCH_HOURS_THRESHOLD = 3
+
+            if not AUTO_SEARCH_ENABLED and not AUTO_MAIN_PAGE_ENABLED:
+                logger.debug("Auto search disabled")
+                return
+
+            # Check if enough time has passed since last post
+            from datetime import datetime
+
+            last_post_time = self.db.get_last_post_time()
+            hours_since_last_post = 999  # Default large value
+
+            if last_post_time:
+                # Convert to datetime if needed
+                if isinstance(last_post_time, str):
+                    try:
+                        last_post_time = datetime.fromisoformat(
+                            last_post_time.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        try:
+                            last_post_time = datetime.strptime(
+                                last_post_time, "%Y-%m-%d %H:%M:%S"
+                            )
+                        except ValueError:
+                            last_post_time = datetime.strptime(
+                                last_post_time, "%Y-%m-%d %H:%M:%S.%f"
+                            )
+
+                time_since_last_post = datetime.now() - last_post_time
+                hours_since_last_post = time_since_last_post.total_seconds() / 3600
+
+                if hours_since_last_post < AUTO_SEARCH_HOURS_THRESHOLD:
+                    logger.debug(
+                        f"⏳ С момента последнего поста прошло {hours_since_last_post:.1f} часов, нужно {AUTO_SEARCH_HOURS_THRESHOLD} часов. Пропускаем автопоиск."
+                    )
+                    return
+
+            # Check if queue is empty
+            queue_size = self.db.get_queue_size()
+            if queue_size > 0:
+                logger.debug(
+                    f"⏳ В очереди уже есть {queue_size} товаров. Пропускаем автопоиск."
+                )
+                return
+
+            logger.info(
+                f"🔍 Auto search run (прошло {hours_since_last_post:.1f} часов с последнего поста)"
+            )
+
+            total_added = 0
+
+            # Search products from main page if enabled
+            if AUTO_MAIN_PAGE_ENABLED:
+                logger.info("🔗 Получаю товары с главной страницы (max 1)...")
+                try:
+                    added = await self.auto_add_products_from_main_page(max_add=1)
+                    total_added += added
+                    if added > 0:
+                        logger.info(f"✅ Добавлен товар с главной страницы: {added}")
+                except Exception as e:
+                    logger.exception(f"Error getting products from main page: {e}")
+
+            if total_added > 0:
+                logger.info(f"Auto search added {total_added} product")
+                # Track last successful auto_search run
+                self.db.set_setting(
+                    "last_auto_search_run", datetime.utcnow().isoformat()
+                )
+
+                # Send notification if bot is provided
+                if bot:
+                    import config
+
+                    if config.ADMIN_ID:
+                        try:
+                            await bot.send_message(
+                                config.ADMIN_ID,
+                                f"🔍 Автопоиск: добавлен {total_added} товар в очередь",
+                            )
+                        except (Exception, asyncio.TimeoutError) as e:
+                            logger.debug(f"Failed to send notification: {e}")
+
+        except Exception as e:
+            logger.exception("run_search_and_queue error: %s", e)
