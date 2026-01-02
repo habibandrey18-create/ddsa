@@ -44,5 +44,5 @@ COPY . .
 RUN mkdir -p logs debug_screenshots
 
 # Run the bot
-CMD ["python", "main.py"]
+CMD ["python", "run.py"]
 

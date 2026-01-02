@@ -19,9 +19,9 @@ async def monitor_system_performance():
     print("=== SYSTEM PERFORMANCE MONITOR ===")
 
     try:
-        from services.monitoring_service import get_monitoring_service
+        from src.services.monitoring_service import get_monitoring_service
         from redis_cache import get_redis_cache
-        from services.affiliate_tracking_service import get_affiliate_tracking_service
+        from src.services.affiliate_tracking_service import get_affiliate_tracking_service
 
         monitoring = get_monitoring_service()
         affiliate_service = get_affiliate_tracking_service()
